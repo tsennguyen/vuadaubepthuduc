@@ -1,0 +1,58 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isImage() {
+      return request.resource != null && request.resource.contentType.matches('image/.*');
+    }
+
+    function withinSizeLimit() {
+      return request.resource != null && request.resource.size < 5 * 1024 * 1024;
+    }
+
+    match /user_avatars/{uid}/{filePath=**} {
+      allow read: if true;
+      allow write: if signedIn()
+        && request.auth.uid == uid
+        && isImage()
+        && withinSizeLimit();
+    }
+
+    match /posts/{pid}/{filePath=**} {
+      allow read: if true;
+      allow write: if signedIn() && isImage() && withinSizeLimit();
+    }
+
+    match /recipes/{rid}/{filePath=**} {
+      allow read: if true;
+      allow write: if signedIn() && isImage() && withinSizeLimit();
+    }
+
+    match /chatMedia/{chatId}/{filePath=**} {
+      allow read: if signedIn();
+      allow write: if signedIn() && request.resource.size < 50 * 1024 * 1024; // 50MB limit for chat
+    }
+
+    match /chat_evidence/{filePath=**} {
+      allow read: if signedIn();
+      allow write: if signedIn() && isImage() && withinSizeLimit();
+    }
+
+    match /chat_avatars/{filePath=**} {
+      allow read: if true;
+      allow write: if signedIn() && isImage() && withinSizeLimit();
+    }
+
+    match /reels/{rid}/{filePath=**} {
+      allow read: if true;
+      allow write: if signedIn() && request.resource.size < 100 * 1024 * 1024; // 100MB limit for reels
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,1149 @@
+import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/material.dart';
+import 'package:go_router/go_router.dart';
+
+import '../../recipe/data/recipe_repository.dart';
+import '../../shopping/application/shopping_from_plan_service.dart';
+import '../../shopping/data/shopping_list_repository.dart';
+import '../data/meal_plan_repository.dart';
+import '../domain/meal_plan_models.dart';
+
+class PlannerPage extends StatefulWidget {
+  const PlannerPage({super.key});
+
+  @override
+  State<PlannerPage> createState() => _PlannerPageState();
+}
+
+class _PlannerPageState extends State<PlannerPage> {
+  late final MealPlanRepository _repository;
+  late final ShoppingFromPlanService _shoppingService;
+
+  late DateTime _weekStart;
+  late Stream<Map<DateTime, List<MealPlanEntry>>> _weekStream;
+  bool _isAiGenerating = false;
+  bool _isGeneratingShopping = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // TODO: Replace with Riverpod provider / DI if desired.
+    _repository = FirestoreMealPlanRepository();
+    _shoppingService = ShoppingFromPlanService(
+      shoppingRepo: FirestoreShoppingListRepository(),
+      mealPlanRepo: _repository,
+      recipeRepo: RecipeRepositoryImpl(),
+    );
+    _weekStart = _startOfWeek(DateTime.now());
+    _weekStream = _repository.watchWeek(_weekStart);
+  }
+
+  void _goPrevWeek() => _setWeekStart(_weekStart.subtract(const Duration(days: 7)));
+
+  void _goNextWeek() => _setWeekStart(_weekStart.add(const Duration(days: 7)));
+
+  void _goThisWeek() => _setWeekStart(_startOfWeek(DateTime.now()));
+
+  void _setWeekStart(DateTime start) {
+    setState(() {
+      _weekStart = DateTime(start.year, start.month, start.day);
+      _weekStream = _repository.watchWeek(_weekStart);
+    });
+  }
+
+  Future<void> _openCreateSheet({
+    required DateTime date,
+    required MealType mealType,
+  }) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (context) => _MealEditSheet(
+        repository: _repository,
+        date: date,
+        mealType: mealType,
+      ),
+    );
+  }
+
+  Future<void> _openEditSheet(MealPlanEntry entry) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (context) => _MealEditSheet(
+        repository: _repository,
+        date: entry.date,
+        mealType: entry.mealType,
+        existing: entry,
+      ),
+    );
+  }
+
+  Future<void> _openCellSheet({
+    required DateTime date,
+    required MealType mealType,
+    required List<MealPlanEntry> entries,
+  }) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      isScrollControlled: true,
+      builder: (context) => _MealCellSheet(
+        date: date,
+        mealType: mealType,
+        entries: entries,
+        onAdd: () => _openCreateSheet(date: date, mealType: mealType),
+        onEdit: _openEditSheet,
+      ),
+    );
+  }
+
+  Future<void> _generateAiPlan() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      _showSnack('Vui lòng đăng nhập để sử dụng tính năng này.');
+      return;
+    }
+
+    final weekLabel = _formatDayMonthYear(_weekStart);
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('AI tạo kế hoạch tuần'),
+        content: Text(
+          'AI sẽ ghi đè kế hoạch tuần bắt đầu $weekLabel (bao gồm các bữa hiện tại). '
+          'Macro chỉ mang tính chất ước lượng, không thay thế tư vấn dinh dưỡng chuyên gia.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Huỷ'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Tạo kế hoạch'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    setState(() => _isAiGenerating = true);
+    try {
+      final callable = FirebaseFunctions.instanceFor(region: 'asia-southeast1')
+          .httpsCallable('aiGenerateMealPlan');
+      final weekIso = _formatIsoDate(_weekStart);
+      await callable.call({
+        'userId': user.uid,
+        'weekStart': weekIso,
+      });
+      if (mounted) {
+        _weekStream = _repository.watchWeek(_weekStart);
+        _showSnack('AI sẽ tạo kế hoạch cho tuần $weekIso');
+      }
+    } on FirebaseFunctionsException catch (e) {
+      _showSnack('Không thể tạo kế hoạch AI: ${e.message ?? e.code}');
+      debugPrint('AI error: ${e.code} ${e.message}');
+    } catch (e) {
+      _showSnack('Không thể tạo kế hoạch AI: $e');
+    } finally {
+      if (mounted) setState(() => _isAiGenerating = false);
+    }
+  }
+
+  Future<void> _generateShoppingList() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Generate shopping list tuần này'),
+        content: const Text(
+          'Danh sách sẽ được gộp vào shopping list hiện có, bạn có muốn tiếp tục không?',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Huỷ'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Tạo danh sách'),
+          ),
+        ],
+      ),
+    );
+    if (confirm != true) return;
+
+    setState(() => _isGeneratingShopping = true);
+    try {
+      await _shoppingService.generateWeeklyShoppingList(_weekStart);
+      _showSnack(
+        'Đã gộp shopping list tuần này.',
+        actionLabel: 'Mo /shopping',
+        onAction: () => context.go('/shopping'),
+      );
+    } catch (e) {
+      _showSnack('Generate shopping list thất bại: $e');
+    } finally {
+      if (mounted) setState(() => _isGeneratingShopping = false);
+    }
+  }
+
+
+  void _showSnack(String message, {String? actionLabel, VoidCallback? onAction}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        action: actionLabel != null && onAction != null
+            ? SnackBarAction(label: actionLabel, onPressed: onAction)
+            : null,
+      ),
+    );
+  }
+
+
+  @override
+  Widget build(BuildContext context) {
+    final headerRange = _weekRangeLabel(_weekStart);
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Kế hoạch'),
+        actions: [
+          IconButton(
+            tooltip: 'AI tạo kế hoạch tuần',
+            onPressed: _isAiGenerating ? null : _generateAiPlan,
+            icon: _isAiGenerating
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.auto_awesome),
+          ),
+          IconButton(
+            tooltip: 'Generate shopping list tuần này',
+            onPressed: _isGeneratingShopping ? null : _generateShoppingList,
+            icon: _isGeneratingShopping
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.shopping_cart_checkout_outlined),
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    headerRange,
+                    style: Theme.of(context).textTheme.titleMedium,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                TextButton(
+                  onPressed: _goPrevWeek,
+                  child: const Text('< Tuần trước'),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.tonal(
+                  onPressed: _goThisWeek,
+                  child: const Text('Tuần này'),
+                ),
+                const SizedBox(width: 8),
+                TextButton(
+                  onPressed: _goNextWeek,
+                  child: const Text('Tuần sau >'),
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+            child: Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: _isAiGenerating ? null : _generateAiPlan,
+                  icon: _isAiGenerating
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.auto_awesome),
+                  label: const Text('AI kế hoạch tuần'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _isGeneratingShopping ? null : _generateShoppingList,
+                  icon: _isGeneratingShopping
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.list_alt_outlined),
+                  label: const Text('Generate shopping list'),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: StreamBuilder<Map<DateTime, List<MealPlanEntry>>>(
+              stream: _weekStream,
+              builder: (context, snapshot) {
+                if (snapshot.hasError) {
+                  return _ErrorView(
+                    message: '${snapshot.error}',
+                    onRetry: () => _setWeekStart(_weekStart),
+                  );
+                }
+                if (!snapshot.hasData) {
+                  return const Center(child: CircularProgressIndicator());
+                }
+
+                final weekData = snapshot.data ?? const <DateTime, List<MealPlanEntry>>{};
+                return _WeekGrid(
+                  weekStart: _weekStart,
+                  weekData: weekData,
+                  onTapCell: _openCellSheet,
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _WeekGrid extends StatelessWidget {
+  const _WeekGrid({
+    required this.weekStart,
+    required this.weekData,
+    required this.onTapCell,
+  });
+
+  final DateTime weekStart;
+  final Map<DateTime, List<MealPlanEntry>> weekData;
+  final Future<void> Function({
+    required DateTime date,
+    required MealType mealType,
+    required List<MealPlanEntry> entries,
+  }) onTapCell;
+
+  @override
+  Widget build(BuildContext context) {
+    final days = List<DateTime>.generate(
+      7,
+      (i) => weekStart.add(Duration(days: i)),
+      growable: false,
+    );
+
+    final byDayId = <String, List<MealPlanEntry>>{};
+    for (final entry in weekData.entries) {
+      byDayId[_dayId(entry.key)] = entry.value;
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final minColumnWidth = constraints.maxWidth >= 900 ? 200.0 : 160.0;
+        final totalMinWidth = minColumnWidth * 7;
+        final totalWidth =
+            constraints.maxWidth >= totalMinWidth ? constraints.maxWidth : totalMinWidth;
+
+        return SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: SizedBox(
+            width: totalWidth,
+            height: constraints.maxHeight,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                for (final day in days)
+                  Expanded(
+                    child: _DayColumn(
+                      date: day,
+                      entries: byDayId[_dayId(day)] ?? const <MealPlanEntry>[],
+                      onTapCell: onTapCell,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _DayColumn extends StatelessWidget {
+  const _DayColumn({
+    required this.date,
+    required this.entries,
+    required this.onTapCell,
+  });
+
+  final DateTime date;
+  final List<MealPlanEntry> entries;
+  final Future<void> Function({
+    required DateTime date,
+    required MealType mealType,
+    required List<MealPlanEntry> entries,
+  }) onTapCell;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final label = '${_weekdayLabel(date)}\n${_formatDayMonth(date)}';
+    final now = DateTime.now();
+    final isToday = now.year == date.year &&
+        now.month == date.month &&
+        now.day == date.day;
+
+    final grouped = <MealType, List<MealPlanEntry>>{
+      for (final t in MealType.values) t: <MealPlanEntry>[],
+    };
+    for (final e in entries) {
+      grouped[e.mealType]?.add(e);
+    }
+
+    return Container(
+      decoration: BoxDecoration(
+        border: Border(
+          right: BorderSide(color: theme.dividerColor),
+        ),
+      ),
+      child: Column(
+        children: [
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+              color: isToday
+                  ? theme.colorScheme.primary.withValues(alpha: 0.08)
+                  : theme.colorScheme.surfaceContainerHighest,
+              border: Border(
+                bottom: BorderSide(color: theme.dividerColor),
+              ),
+            ),
+            child: Text(
+              label,
+              textAlign: TextAlign.center,
+              style: theme.textTheme.titleSmall,
+            ),
+          ),
+          for (final mealType in MealType.values)
+            Expanded(
+              child: _MealCell(
+                date: date,
+                mealType: mealType,
+                entries: grouped[mealType] ?? const <MealPlanEntry>[],
+                isToday: isToday,
+                onTap: () => onTapCell(
+                  date: date,
+                  mealType: mealType,
+                  entries: grouped[mealType] ?? const <MealPlanEntry>[],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MealCell extends StatelessWidget {
+  const _MealCell({
+    required this.date,
+    required this.mealType,
+    required this.entries,
+    required this.isToday,
+    required this.onTap,
+  });
+
+  final DateTime date;
+  final MealType mealType;
+  final List<MealPlanEntry> entries;
+  final bool isToday;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final title = _mealTypeLabel(mealType);
+
+    return InkWell(
+      onTap: onTap,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          border: Border(
+            bottom: BorderSide(color: theme.dividerColor),
+          ),
+          color: isToday ? theme.colorScheme.primary.withValues(alpha: 0.04) : null,
+        ),
+        child: entries.isEmpty
+            ? _EmptyMealCell(title: title)
+            : _FilledMealCell(title: title, entries: entries),
+      ),
+    );
+  }
+}
+
+class _EmptyMealCell extends StatelessWidget {
+  const _EmptyMealCell({required this.title});
+
+  final String title;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: theme.textTheme.labelMedium),
+        const Spacer(),
+        Row(
+          children: [
+            Icon(Icons.add_circle_outline, size: 18, color: theme.hintColor),
+            const SizedBox(width: 6),
+            Text('Thêm', style: theme.textTheme.bodySmall),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+class _FilledMealCell extends StatelessWidget {
+  const _FilledMealCell({required this.title, required this.entries});
+
+  final String title;
+  final List<MealPlanEntry> entries;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final first = entries.first;
+    final moreCount = entries.length - 1;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: theme.textTheme.labelMedium),
+        const SizedBox(height: 6),
+        Text(
+          _mealLabel(first),
+          style: theme.textTheme.bodyMedium,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
+        Text(
+          'x${first.servings}',
+          style: theme.textTheme.bodySmall,
+        ),
+        if (moreCount > 0) ...[
+          const SizedBox(height: 4),
+          Text(
+            '+$moreCount meal(s)',
+            style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+          ),
+        ],
+        const Spacer(),
+        Text(
+          'Nhấn để xem',
+          style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+        ),
+      ],
+    );
+  }
+}
+
+class _MealCellSheet extends StatelessWidget {
+  const _MealCellSheet({
+    required this.date,
+    required this.mealType,
+    required this.entries,
+    required this.onAdd,
+    required this.onEdit,
+  });
+
+  final DateTime date;
+  final MealType mealType;
+  final List<MealPlanEntry> entries;
+  final VoidCallback onAdd;
+  final Future<void> Function(MealPlanEntry) onEdit;
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: EdgeInsets.only(
+          left: 16,
+          right: 16,
+          top: 12,
+          bottom: 16 + MediaQuery.viewInsetsOf(context).bottom,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '${_mealTypeLabel(mealType)} • ${_formatDayMonthYear(date)}',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 12),
+            if (entries.isEmpty)
+              _EmptyDetail(onAdd: onAdd)
+            else
+              ...entries.map((e) => _MealDetailTile(entry: e, onEdit: () => onEdit(e))),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: onAdd,
+                icon: const Icon(Icons.add),
+                label: const Text('Thêm món'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MealDetailTile extends StatelessWidget {
+  const _MealDetailTile({required this.entry, required this.onEdit});
+
+  final MealPlanEntry entry;
+  final VoidCallback onEdit;
+
+  @override
+  Widget build(BuildContext context) {
+    final subtitle = [
+      if (entry.servings > 0) 'Servings: x${entry.servings}',
+      if (entry.note?.isNotEmpty == true) entry.note!,
+    ].join(' • ');
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: ListTile(
+        title: Text(_mealLabel(entry)),
+        subtitle: subtitle.isNotEmpty ? Text(subtitle) : null,
+        trailing: IconButton(
+          icon: const Icon(Icons.chevron_right),
+          onPressed: onEdit,
+        ),
+        onTap: () => context.push('/recipe/${entry.recipeId}'),
+      ),
+    );
+  }
+}
+
+class _EmptyDetail extends StatelessWidget {
+  const _EmptyDetail({required this.onAdd});
+
+  final VoidCallback onAdd;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Chưa có món cho bữa này'),
+          const SizedBox(height: 8),
+          FilledButton.tonalIcon(
+            onPressed: onAdd,
+            icon: const Icon(Icons.restaurant_outlined),
+            label: const Text('Thêm món'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ignore: unused_element
+class _MealSelectSheet extends StatelessWidget {
+  const _MealSelectSheet({
+    required this.date,
+    required this.mealType,
+    required this.entries,
+    required this.onSelect,
+    required this.onAddNew,
+  });
+
+  final DateTime date;
+  final MealType mealType;
+  final List<MealPlanEntry> entries;
+  final ValueChanged<MealPlanEntry> onSelect;
+  final VoidCallback onAddNew;
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '${_mealTypeLabel(mealType)} • ${_formatDayMonthYear(date)}',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 12),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 360),
+              child: ListView.separated(
+                shrinkWrap: true,
+                itemCount: entries.length,
+                separatorBuilder: (_, __) => const Divider(height: 1),
+                itemBuilder: (context, index) {
+                  final e = entries[index];
+                  return ListTile(
+                    title: Text(_mealLabel(e)),
+                    subtitle: Text('Servings: x${e.servings}'),
+                    trailing: const Icon(Icons.chevron_right),
+                    onTap: () => onSelect(e),
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: FilledButton.icon(
+                onPressed: onAddNew,
+                icon: const Icon(Icons.add),
+                label: const Text('Thêm bữa mới'),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MealEditSheet extends StatefulWidget {
+  const _MealEditSheet({
+    required this.repository,
+    required this.date,
+    required this.mealType,
+    this.existing,
+  });
+
+  final MealPlanRepository repository;
+  final DateTime date;
+  final MealType mealType;
+  final MealPlanEntry? existing;
+
+  @override
+  State<_MealEditSheet> createState() => _MealEditSheetState();
+}
+
+class _MealEditSheetState extends State<_MealEditSheet> {
+  late final TextEditingController _recipeIdController;
+  late final TextEditingController _servingsController;
+  late final TextEditingController _noteController;
+
+  bool _isSaving = false;
+
+  bool get _isEdit => widget.existing != null;
+
+  @override
+  void initState() {
+    super.initState();
+    _recipeIdController = TextEditingController(
+      text: widget.existing?.recipeId ?? '',
+    );
+    _servingsController = TextEditingController(
+      text: (widget.existing?.servings ?? 1).toString(),
+    );
+    _noteController = TextEditingController(text: widget.existing?.note ?? '');
+  }
+
+  @override
+  void dispose() {
+    _recipeIdController.dispose();
+    _servingsController.dispose();
+    _noteController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _save() async {
+    final recipeId = _recipeIdController.text.trim();
+    final servings = int.tryParse(_servingsController.text.trim()) ?? 1;
+    final note = _noteController.text.trim();
+
+    if (!_isEdit && recipeId.isEmpty) {
+      _showSnack('Vui lòng nhập recipeId (tạm thời).');
+      return;
+    }
+    if (servings <= 0) {
+      _showSnack('Servings phải > 0');
+      return;
+    }
+
+    setState(() => _isSaving = true);
+    try {
+      if (_isEdit) {
+        final old = widget.existing!;
+        final updated = MealPlanEntry(
+          id: old.id,
+          recipeId: old.recipeId,
+          mealType: old.mealType,
+          servings: servings,
+          note: note.isEmpty ? null : note,
+          date: old.date,
+          plannedFor: old.plannedFor,
+        );
+        await widget.repository.updateMeal(updated);
+      } else {
+        final entry = MealPlanEntry(
+          id: '',
+          recipeId: recipeId,
+          mealType: widget.mealType,
+          servings: servings,
+          note: note.isEmpty ? null : note,
+          date: widget.date,
+          plannedFor: null,
+        );
+        await widget.repository.addMeal(entry);
+      }
+
+      if (!mounted) return;
+      Navigator.of(context).pop();
+    } catch (e) {
+      _showSnack('Lưu thất bại: $e');
+    } finally {
+      if (mounted) setState(() => _isSaving = false);
+    }
+  }
+
+  Future<void> _delete() async {
+    final existing = widget.existing;
+    if (existing == null) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Xoá bữa ăn?'),
+        content: const Text('Bạn chắc chắn muốn xoá bữa ăn này?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Huỷ'),
+          ),
+          FilledButton.tonal(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Xoá'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed != true) return;
+
+    setState(() => _isSaving = true);
+    try {
+      await widget.repository.deleteMeal(existing.dayId, existing.id);
+      if (!mounted) return;
+      Navigator.of(context).pop();
+    } catch (e) {
+      _showSnack('Xoá thất bại: $e');
+    } finally {
+      if (mounted) setState(() => _isSaving = false);
+    }
+  }
+
+  void _chooseRecipePlaceholder() {
+    _showSnack('TODO: mở màn chọn recipe.');
+  }
+
+  void _showSnack(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final existing = widget.existing;
+    final title = _isEdit ? 'Chi tiết bữa ăn' : 'Thêm vào kế hoạch';
+
+    return SafeArea(
+      child: Padding(
+        padding: EdgeInsets.only(
+          left: 16,
+          right: 16,
+          top: 8,
+          bottom: 16 + MediaQuery.viewInsetsOf(context).bottom,
+        ),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: Theme.of(context).textTheme.titleLarge),
+              const SizedBox(height: 12),
+              _ReadOnlyRow(
+                label: 'Ngày',
+                value: _formatDayMonthYear(widget.date),
+              ),
+              _ReadOnlyRow(label: 'Bữa', value: _mealTypeLabel(widget.mealType)),
+              const SizedBox(height: 12),
+              if (_isEdit) ...[
+                _ReadOnlyRow(label: 'RecipeId', value: existing!.recipeId),
+              ] else ...[
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _recipeIdController,
+                        decoration: const InputDecoration(
+                          labelText: 'RecipeId (tạm thời nhập tay)',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.tonalIcon(
+                      onPressed: _isSaving ? null : _chooseRecipePlaceholder,
+                      icon: const Icon(Icons.restaurant_menu_outlined),
+                      label: const Text('Chọn recipe'),
+                    ),
+                  ],
+                ),
+              ],
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _servingsController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'Servings',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: TextField(
+                      controller: _noteController,
+                      decoration: const InputDecoration(
+                        labelText: 'Note (optional)',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              Row(
+                children: [
+                  if (_isEdit)
+                    TextButton.icon(
+                      onPressed: _isSaving ? null : _delete,
+                      icon: const Icon(Icons.delete_outline),
+                      label: const Text('Xoá'),
+                    ),
+                  const Spacer(),
+                  TextButton(
+                    onPressed:
+                        _isSaving ? null : () => Navigator.of(context).pop(),
+                    child: const Text('Đóng'),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton(
+                    onPressed: _isSaving ? null : _save,
+                    child: _isSaving
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : Text(_isEdit ? 'Lưu' : 'Thêm'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ReadOnlyRow extends StatelessWidget {
+  const _ReadOnlyRow({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 6),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 80,
+            child: Text(
+              label,
+              style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              value.isNotEmpty ? value : '—',
+              style: theme.textTheme.bodyMedium,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ErrorView extends StatelessWidget {
+  const _ErrorView({required this.message, required this.onRetry});
+
+  final String message;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 560),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Không tải được kế hoạch',
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+              const SizedBox(height: 8),
+              Text(message, textAlign: TextAlign.center),
+              const SizedBox(height: 12),
+              ElevatedButton.icon(
+                onPressed: onRetry,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Thử lại'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+DateTime _startOfWeek(DateTime date) {
+  final local = date.toLocal();
+  final d = DateTime(local.year, local.month, local.day);
+  return d.subtract(Duration(days: d.weekday - DateTime.monday));
+}
+
+String _weekdayLabel(DateTime date) {
+  switch (date.weekday) {
+    case DateTime.monday:
+      return 'Th2';
+    case DateTime.tuesday:
+      return 'Th3';
+    case DateTime.wednesday:
+      return 'Th4';
+    case DateTime.thursday:
+      return 'Th5';
+    case DateTime.friday:
+      return 'Th6';
+    case DateTime.saturday:
+      return 'Th7';
+    case DateTime.sunday:
+      return 'CN';
+  }
+  return '';
+}
+
+String _formatDayMonth(DateTime date) {
+  String two(int n) => n.toString().padLeft(2, '0');
+  final d = date.toLocal();
+  return '${two(d.day)}/${two(d.month)}';
+}
+
+String _formatDayMonthYear(DateTime date) {
+  String two(int n) => n.toString().padLeft(2, '0');
+  final d = date.toLocal();
+  return '${two(d.day)}/${two(d.month)}/${d.year}';
+}
+
+String _weekRangeLabel(DateTime weekStart) {
+  final start = weekStart.toLocal();
+  final end = start.add(const Duration(days: 6));
+  return '${_formatDayMonthYear(start)} - ${_formatDayMonthYear(end)}';
+}
+
+String _formatIsoDate(DateTime date) {
+  String two(int n) => n.toString().padLeft(2, '0');
+  final d = date.toLocal();
+  return '${d.year}-${two(d.month)}-${two(d.day)}';
+}
+
+String _dayId(DateTime date) {
+  String two(int n) => n.toString().padLeft(2, '0');
+  final d = date.toLocal();
+  return '${d.year}-${two(d.month)}-${two(d.day)}';
+}
+
+String _mealTypeLabel(MealType type) {
+  switch (type) {
+    case MealType.breakfast:
+      return 'Sáng';
+    case MealType.lunch:
+      return 'Trưa';
+    case MealType.dinner:
+      return 'Tối';
+    case MealType.snack:
+      return 'Snack';
+  }
+}
+
+String _shortRecipeLabel(String recipeId) {
+  final trimmed = recipeId.trim();
+  if (trimmed.isEmpty) return '(No recipe)';
+  if (trimmed.length <= 10) return trimmed;
+  return '${trimmed.substring(0, 10)}...';
+}
+
+String _mealLabel(MealPlanEntry entry) {
+  final t = entry.title?.trim();
+  if (t != null && t.isNotEmpty) return t;
+  return _shortRecipeLabel(entry.recipeId);
+}

@@ -1,0 +1,51 @@
+name: vua_dau_bep_thu_duc
+description: Vua Đầu Bếp Thủ Đức Flutter app.
+publish_to: "none"
+
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+  go_router: ^14.8.1
+  flutter_riverpod: ^2.5.1
+  firebase_core: ^3.5.0
+  firebase_auth: ^5.3.1
+  cloud_firestore: ^5.4.0
+  firebase_storage: ^12.2.0
+  cloud_functions: ^5.0.0
+  google_sign_in: ^6.3.0
+  flutter_facebook_auth: ^7.0.0
+  cached_network_image: ^3.4.1
+  google_fonts: ^6.1.0
+  image_picker: ^1.1.2
+  emoji_picker_flutter: ^4.4.0
+  record:
+    path: ./packages/record
+  path_provider: ^2.1.4
+  video_player: ^2.9.1
+  audioplayers: ^6.1.0
+  share_plus: ^10.1.3
+  shared_preferences: ^2.3.3
+  fl_chart: ^0.69.0
+  firebase_analytics: ^11.3.0
+  url_launcher: ^6.3.2
+  timeago: ^3.7.1
+  flutter_localizations:
+    sdk: flutter
+  intl: ^0.20.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  integration_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true

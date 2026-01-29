@@ -1,0 +1,524 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ========================================
+    // HELPER FUNCTIONS
+    // ========================================
+    
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function userRole() {
+      return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get('role', null)
+        : null;
+    }
+
+    function isAdmin() {
+      return userRole() == 'admin';
+    }
+
+    function isMod() {
+      return userRole() == 'moderator';
+    }
+
+    function isAdminOrMod() {
+      return isAdmin() || isMod();
+    }
+
+    function isOwner(data) {
+      return signedIn()
+        && (data.ownerId == request.auth.uid || data.authorId == request.auth.uid);
+    }
+
+    function isChatMember(chatId) {
+      return signedIn()
+        && request.auth.uid in get(/databases/$(database)/documents/chats/$(chatId)).data.memberIds;
+    }
+
+    // Check if two users are friends (bidirectional)
+    function areFriends(uidA, uidB) {
+      return
+        exists(/databases/$(database)/documents/friends/$(uidA)/items/$(uidB)) &&
+        exists(/databases/$(database)/documents/friends/$(uidB)/items/$(uidA));
+    }
+
+    // ========================================
+    // USERS COLLECTION
+    // ========================================
+    match /users/{uid} {
+      // Read: any signed-in user can read profiles
+      allow read: if signedIn();
+
+      // Create: user can create their own profile during signup
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasAll(['displayName', 'email', 'createdAt'])
+        && request.resource.data.createdAt == request.time;
+
+      // Update: user can update own profile, or admin can update any
+      allow update: if signedIn()
+        && (request.auth.uid == uid || isAdminOrMod());
+
+      // Delete: only admin
+      allow delete: if isAdmin();
+
+      // Subcollection: bookmarks (recipes bookmarked by user)
+      match /bookmarks/{recipeId} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      // Subcollection: plannerSettings
+      match /plannerSettings/{docId} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+
+      // Block any other subcollections under users
+      match /{document=**} {
+        allow read: if false;
+        allow write: if false;
+      }
+    }
+
+    // ========================================
+    // MEAL PLANS
+    // ========================================
+    // Structure: mealPlans/{uid}/days/{yyyy-MM-dd}/meals/{mealId}
+    match /mealPlans/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+
+      match /{document=**} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+    }
+
+    // ========================================
+    // SHOPPING LISTS
+    // ========================================
+    // Structure: shoppingLists/{uid}/items/{itemId}
+    match /shoppingLists/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+
+      match /{document=**} {
+        allow read, write: if signedIn() && request.auth.uid == uid;
+      }
+    }
+
+    // ========================================
+    // FOLLOWS (one-way following)
+    // ========================================
+    // Structure: follows/{uid}/targets/{targetUid}
+    match /follows/{uid}/targets/{targetUid} {
+      // Read: owner (uid), target (targetUid), or admin/mod
+      allow read: if signedIn()
+        && (
+          request.auth.uid == uid ||
+          request.auth.uid == targetUid ||
+          isAdminOrMod()
+        );
+
+      // Write: owner can follow/unfollow, or target can update (when accepting friend request)
+      allow create, update, delete: if signedIn()
+        && (request.auth.uid == uid || request.auth.uid == targetUid);
+    }
+
+    // ========================================
+    // FRIEND REQUESTS
+    // ========================================
+    match /friendRequests/{requestId} {
+      // Create: requester creates with their UID as requesterId
+      allow create: if signedIn()
+        && request.resource.data.requesterId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.targetId is string
+        && request.resource.data.targetId.size() > 0;
+
+      // Read: requester, target, or admin/mod
+      allow read: if signedIn()
+        && (
+          resource.data.requesterId == request.auth.uid ||
+          resource.data.targetId == request.auth.uid ||
+          isAdminOrMod()
+        );
+
+      // Update: requester can cancel, target can accept/reject, admin/mod can override
+      allow update: if signedIn()
+        && (
+          // Requester cancels
+          (
+            request.auth.uid == resource.data.requesterId
+            && resource.data.status == 'pending'
+            && request.resource.data.status == 'cancelled'
+          ) ||
+          // Target accepts/rejects
+          (
+            request.auth.uid == resource.data.targetId
+            && resource.data.status == 'pending'
+            && request.resource.data.status in ['accepted', 'rejected']
+          ) ||
+          // Admin/mod override
+          isAdminOrMod()
+        );
+
+      // Delete: only admin/mod
+      allow delete: if isAdminOrMod();
+    }
+
+    // ========================================
+    // FRIENDS (bidirectional friendship)
+    // ========================================
+    // Structure: friends/{uid}/items/{friendUid}
+    match /friends/{uid}/items/{friendUid} {
+      // Read: owner (uid), friend (friendUid), or admin/mod
+      allow read: if signedIn()
+        && (
+          request.auth.uid == uid ||
+          request.auth.uid == friendUid ||
+          isAdminOrMod()
+        );
+
+      // Write: owner or friend can create/update/delete (for accept/unfriend operations)
+      allow create, update, delete: if signedIn()
+        && (request.auth.uid == uid || request.auth.uid == friendUid);
+    }
+
+    // ========================================
+    // POSTS + SUBCOLLECTIONS
+    // ========================================
+    match /posts/{pid} {
+      // Read: public (anyone, even unauthenticated for feed browsing)
+      allow read: if true;
+
+      // Create: signed-in users can create posts with their UID as authorId
+      allow create: if signedIn()
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.createdAt == request.time;
+
+      // Update: 
+      // - Owner/admin can update all fields
+      // - Any signed-in user can update counter fields (likesCount, commentsCount, etc)
+      allow update: if signedIn() && (
+        // Owner or admin updating any fields
+        (isOwner(resource.data) || isAdminOrMod()) ||
+        // Anyone updating ONLY counter fields (via FieldValue.increment)
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+          ['likesCount', 'commentsCount', 'sharesCount', 'updatedAt']
+        ))
+      );
+      
+      // Delete: owner or admin/mod
+      allow delete: if signedIn() && (isOwner(resource.data) || isAdminOrMod());
+
+      // Subcollections: likes, reactions, shares (use userId as doc ID)
+      match /{subcollection}/{sid} {
+        // Read: public (for displaying like counts/status in feed)
+        allow read: if subcollection in ['likes', 'reactions', 'shares'];
+
+        // Create: document ID must be user's UID
+        allow create: if signedIn()
+          && subcollection in ['likes', 'reactions', 'shares']
+          && sid == request.auth.uid
+          && request.resource.data.createdAt == request.time;
+
+        // Update: user updates their own
+        allow update: if signedIn()
+          && subcollection in ['likes', 'reactions', 'shares']
+          && sid == request.auth.uid;
+
+        // Delete: owner or admin/mod
+        allow delete: if signedIn()
+          && (sid == request.auth.uid || isAdminOrMod());
+      }
+
+      // Subcollection: comments (use auto-generated doc ID)
+      match /comments/{commentId} {
+        allow read: if signedIn();
+
+        // Create: authorId must be current user, auto-generated doc ID
+        allow create: if signedIn()
+          && request.resource.data.authorId == request.auth.uid
+          && request.resource.data.createdAt == request.time;
+
+        // Update: only comment author can update
+        allow update: if signedIn()
+          && resource.data.authorId == request.auth.uid;
+
+        // Delete: author or admin/mod
+        allow delete: if signedIn()
+          && (resource.data.authorId == request.auth.uid || isAdminOrMod());
+      }
+    }
+
+    // ========================================
+    // RECIPES + SUBCOLLECTIONS
+    // ========================================
+    match /recipes/{rid} {
+      // Read: public
+      allow read: if true;
+
+      // Create: signed-in users with their UID as authorId
+      allow create: if signedIn()
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.createdAt == request.time;
+
+      // Update: 
+      // - Owner/admin can update all fields
+      // - Any signed-in user can update counter fields (likesCount, commentsCount, etc)
+      allow update: if signedIn() && (
+        // Owner or admin updating any fields
+        (isOwner(resource.data) || isAdminOrMod()) ||
+        // Anyone updating ONLY counter fields (via FieldValue.increment)
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+          ['likesCount', 'commentsCount', 'sharesCount', 'ratingsCount', 'rating', 'avgRating', 'updatedAt']
+        ))
+      );
+      
+      // Delete: owner or admin/mod
+      allow delete: if signedIn() && (isOwner(resource.data) || isAdminOrMod());
+
+      // Subcollections: likes, reactions, ratings, shares (use userId as doc ID)
+      match /{subcollection}/{sid} {
+        // Read: public (for displaying like counts/status/ratings in feed)
+        allow read: if subcollection in ['likes', 'reactions', 'ratings', 'shares'];
+
+        // Create: document ID must be user's UID
+        allow create: if signedIn()
+          && subcollection in ['likes', 'reactions', 'ratings', 'shares']
+          && sid == request.auth.uid
+          && request.resource.data.createdAt == request.time;
+
+        // Update: user updates their own
+        allow update: if signedIn()
+          && subcollection in ['likes', 'reactions', 'ratings', 'shares']
+          && sid == request.auth.uid;
+
+        // Delete: owner or admin/mod
+        allow delete: if signedIn()
+          && (sid == request.auth.uid || isAdminOrMod());
+      }
+
+      // Subcollection: comments (use auto-generated doc ID)
+      match /comments/{commentId} {
+        allow read: if signedIn();
+
+        // Create: authorId must be current user, auto-generated doc ID
+        allow create: if signedIn()
+          && request.resource.data.authorId == request.auth.uid
+          && request.resource.data.createdAt == request.time;
+
+        // Update: only comment author can update
+        allow update: if signedIn()
+          && resource.data.authorId == request.auth.uid;
+
+        // Delete: author or admin/mod
+        allow delete: if signedIn()
+          && (resource.data.authorId == request.auth.uid || isAdminOrMod());
+      }
+    }
+
+    // ========================================
+    // CHATS + MESSAGES
+    // ========================================
+    match /chats/{cid} {
+      // TEMPORARY: Permissive for debugging - will tighten later
+      allow list: if signedIn();
+      allow get: if signedIn() && (request.auth.uid in resource.data.memberIds || isAdminOrMod());
+
+      // Create chat:
+      // - DM (type='dm'): must have exactly 2 members who are friends
+      // - Group or unspecified: current user must be in memberIds
+      allow create: if signedIn()
+        && request.resource.data.memberIds != null
+        && request.auth.uid in request.resource.data.memberIds
+        && (
+          // Not a DM or type not specified
+          !('type' in request.resource.data) ||
+          request.resource.data.type != 'dm' ||
+          // DM: exactly 2 members and they are friends
+          (
+            request.resource.data.type == 'dm'
+            && request.resource.data.memberIds.size() == 2
+            && areFriends(
+              request.resource.data.memberIds[0],
+              request.resource.data.memberIds[1]
+            )
+          )
+        );
+
+      // Update chat metadata: members can update (for muting, typing, theme, etc.)
+      // Admin/mod can also update (for locking chats, etc.)
+      allow update: if signedIn()
+        && (request.auth.uid in resource.data.memberIds || isAdminOrMod());
+
+      // Delete chat: only admin/mod
+      allow delete: if isAdminOrMod();
+
+      // Messages subcollection
+      match /messages/{mid} {
+        // Read: members or admin/mod
+        allow read: if signedIn()
+          && (isChatMember(cid) || isAdminOrMod());
+
+        // Create: member sends message with their UID as senderId
+        allow create: if signedIn()
+          && isChatMember(cid)
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.createdAt == request.time;
+
+        // Update: sender can update their own message (for edits, reactions)
+        allow update: if signedIn()
+          && isChatMember(cid)
+          && (resource.data.senderId == request.auth.uid || isAdminOrMod());
+
+        // Delete: sender can soft-delete their own message, or admin/mod
+        allow delete: if signedIn()
+          && (
+            (isChatMember(cid) && resource.data.senderId == request.auth.uid) ||
+            isAdminOrMod()
+          );
+      }
+    }
+
+    // ========================================
+    // REPORTS
+    // ========================================
+    match /reports/{reportId} {
+      // Create: signed-in users can create reports
+      allow create: if signedIn()
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.status == 'pending';
+
+      // Read: reporter can see their own reports, admin/mod can see all
+      allow read: if signedIn()
+        && (resource.data.reporterId == request.auth.uid || isAdminOrMod());
+
+      // Update/Delete: only admin/mod
+      allow update, delete: if isAdminOrMod();
+    }
+
+    // ========================================
+    // AUDIT LOGS (admin only, append-only by backend)
+    // ========================================
+    match /auditLogs/{logId} {
+      // Read: admin/mod only
+      allow read: if isAdminOrMod();
+
+      // Write: never from client (only backend/Functions)
+      allow create, update, delete: if false;
+    }
+
+    // ========================================
+    // LEADERBOARDS (public read, backend write)
+    // ========================================
+    match /leaderboards/{lid} {
+      // Read: public
+      allow read: if true;
+
+      // Write: only backend with custom claim admin=true
+      allow create, update, delete: if signedIn()
+        && request.auth.token.admin == true;
+    }
+
+    // ========================================
+    // AI CONFIGS (centralized AI prompts/settings)
+    // ========================================
+    match /aiConfigs/{configId} {
+      // Read: signed-in users (to show AI config info if needed by client)
+      allow read: if signedIn();
+
+      // Write: only admin
+      allow create, update, delete: if isAdmin();
+    }
+
+    // ========================================
+    // ADMIN SETTINGS (general app settings)
+    // ========================================
+    match /adminSettings/{docId} {
+      // Read: admin/mod only
+      allow read: if isAdminOrMod();
+
+      // Write: admin/mod only
+      allow create, update, delete: if isAdminOrMod();
+    }
+
+    // ========================================
+    // CHAT VIOLATIONS (moderation actions)
+    // ========================================
+    match /chatViolations/{violationId} {
+      // Read: admin/mod only
+      allow read: if isAdminOrMod();
+
+      // Write: admin/mod only (for reviewing and updating violation statuses)
+      // Backend Functions also write here via service account
+      allow create, update, delete: if isAdminOrMod();
+    }
+
+
+
+    // ========================================
+    // NOTIFICATIONS COLLECTION
+    // ========================================
+    match /notifications/{notificationId} {
+      // Read: only the recipient or admin/mod
+      allow read: if signedIn()
+        && (resource.data.userId == request.auth.uid || isAdminOrMod());
+
+      // Create: TEMP - allow any signed in user (for debugging)
+      allow create: if signedIn();
+
+      // Update: only recipient can mark as read
+      allow update: if signedIn()
+        && resource.data.userId == request.auth.uid;
+
+      // Delete: only recipient or admin/mod
+      allow delete: if signedIn()
+        && (resource.data.userId == request.auth.uid || isAdminOrMod());
+    }
+    
+    // ========================================
+    // REELS COLLECTION
+    // ========================================
+    match /reels/{rid} {
+      // Read: public
+      allow read: if true;
+
+      // Create: signed-in users with their UID as authorId
+      allow create: if signedIn()
+        && request.resource.data.authorId == request.auth.uid
+        && request.resource.data.createdAt == request.time;
+
+      // Update: 
+      // - Owner/admin can update all fields
+      // - Any signed-in user can update counter fields (likesCount, etc)
+      allow update: if signedIn() && (
+        (isOwner(resource.data) || isAdminOrMod()) ||
+        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(
+          ['likesCount', 'commentsCount', 'sharesCount', 'viewsCount', 'updatedAt']
+        ))
+      );
+      
+      // Delete: owner or admin/mod
+      allow delete: if signedIn() && (isOwner(resource.data) || isAdminOrMod());
+
+      // Subcollections: likes, comments, etc.
+      match /{subcollection}/{sid} {
+        allow read: if true;
+        allow write: if signedIn();
+      }
+    }
+
+
+    // ========================================
+    // DEFAULT DENY ALL OTHER COLLECTIONS (DISABLED FOR DEBUGGING)
+    // ========================================
+    // This ensures any collection not explicitly defined above is denied
+    // TEMPORARILY DISABLED - RE-ENABLE AFTER NOTIFICATIONS WORK
+    // match /{document=**} {
+    //   allow read, write: if false;
+    // }
+  }
+}

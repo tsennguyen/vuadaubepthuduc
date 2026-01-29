@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "203285704976",
+    "project_id": "vuadaubepthuduc",
+    "storage_bucket": "vuadaubepthuduc.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:203285704976:android:f92f342f9e9e31ba3e7595",
+        "android_client_info": {
+          "package_name": "com.vuadaubepthuduc"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "203285704976-sobbk3jtpdgb15m6m13gue1pbuc980p3.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.vuadaubepthuduc",
+            "certificate_hash": "18efa76aed870db5962ba86d6f370167ab8d116d"
+          }
+        },
+        {
+          "client_id": "203285704976-ik544strb87sosidm1j0d4gcs6i8v2jq.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDGeqqujkwmWuDgfYgJXtukxQkzLhoG--4"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "203285704976-ik544strb87sosidm1j0d4gcs6i8v2jq.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
